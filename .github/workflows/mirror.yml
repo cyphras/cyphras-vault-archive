@@ -12,7 +12,6 @@ name: mirror
 # windows and the manifest in one reviewed commit before enabling it again.
 on:
   schedule:
-    - cron: "17 14 * * *"
     - cron: "17 3 * * *"
     - cron: "43 4 * * 1"
   workflow_dispatch:
