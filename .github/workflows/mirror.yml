@@ -1,0 +1,261 @@
+name: mirror
+
+# Copies the published vault archive of each network into this repository and checks it. Nothing
+# here holds a secret: the archive is public chain data, read from a public URL, and this
+# workflow's own token is the only credential it uses, passed to git only for the push. The archive
+# tool is taken from the release image pinned below, whose attestation is checked against the
+# release tag and commit first. The daily run mirrors. The weekly run rebuilds the mainnet windows
+# added since its last pass from the public ledger metadata archive, at most 30 a run, and records
+# how far it got in mainnet/crosschecked; the daily run refuses to add to a mainnet copy that is
+# already more than 15 windows past that. If the cross-check fails, a published window differs from
+# the ledger archive: disable this workflow, find which producer is wrong, and replace the bad
+# windows and the manifest in one reviewed commit before enabling it again.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The first three values are filled in after the services release that contains the archive image:
+# the image by the digest the release records, the commit and the tag by the release's. Until then
+# the checks below stop every run.
+env:
+  ARCHIVE_IMAGE: ghcr.io/cyphras/cyphras-contracts/archive@sha256:89868b6f81dd3a3a2d61e0673a5a10a0214d0a87c93476cbb2e5868735523b53
+  CONTRACTS_COMMIT: 01e41cd76d481cba8ff1927927b5d735abf6d604
+  RELEASE_TAG: services-v1.1.0
+  LEDGER_META: https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/pubnet
+  WINDOW_LEDGERS: "17280"
+  CROSSCHECK_BATCH: "30"
+  MAX_UNCHECKED: "15"
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    # The weekly run is for the cross-check. Mainnet is mirrored once MAINNET_ENABLED is true.
+    if: github.event.schedule != '43 4 * * 1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        network: ${{ fromJSON(vars.MAINNET_ENABLED == 'true' && '["testnet","mainnet"]' || '["testnet"]') }}
+    env:
+      NETWORK: ${{ matrix.network }}
+      RPC_URL_1: ${{ vars[format('{0}_RPC_URL_1', matrix.network)] }}
+      RPC_URL_2: ${{ vars[format('{0}_RPC_URL_2', matrix.network)] }}
+    steps:
+      - name: Check the pins and the RPC endpoints
+        run: |
+          [[ "$ARCHIVE_IMAGE" =~ ^ghcr\.io/cyphras/cyphras-contracts/archive@sha256:[0-9a-f]{64}$ ]]
+          [[ "$CONTRACTS_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^services-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RPC_URL_1" =~ ^https://[^/]+ ]]
+          [[ "$RPC_URL_2" =~ ^https://[^/]+ ]]
+          test "$(printf '%s' "$RPC_URL_1" | cut -d/ -f3)" != "$(printf '%s' "$RPC_URL_2" | cut -d/ -f3)"
+      # A schedule run has no event payload, so the default branch is asked of the API.
+      - name: Find the default branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+      # The branch tip and not the commit the schedule fired on, so a network that runs after
+      # another one starts from what that one pushed. The token is not kept in the checkout: the
+      # archive tool reads files from a public URL while this job runs, and only the push gets it.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.branch.outputs.name }}
+          persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: cyphras/cyphras-contracts
+          ref: ${{ env.CONTRACTS_COMMIT }}
+          path: contracts
+          sparse-checkout: deployments
+          persist-credentials: false
+      - name: Get the archive tool from the pinned release image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://$ARCHIVE_IMAGE" --repo cyphras/cyphras-contracts \
+            --signer-workflow cyphras/cyphras-contracts/.github/workflows/services-release.yml \
+            --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$CONTRACTS_COMMIT" \
+            --deny-self-hosted-runners > /dev/null
+          container=$(docker create "$ARCHIVE_IMAGE")
+          docker cp "$container:/service" "$RUNNER_TEMP/archive"
+          docker rm "$container" > /dev/null
+      # The gate looks at the mainnet copy already committed, before the fetch replaces it, so the
+      # first publication and a catch-up of many windows can always be committed once, and the
+      # cross-check then works through them.
+      - name: Check that the cross-check is not too far behind
+        if: matrix.network == 'mainnet'
+        run: |
+          manifest=mainnet/xlm/manifest.json
+          if [ ! -f "$manifest" ]; then
+            echo "nothing is committed yet"
+            exit 0
+          fi
+          covered=$(jq -r .coveredTo "$manifest")
+          first=$(jq -r '.windows[0].start // empty' "$manifest")
+          if [ -z "$first" ]; then
+            echo "the committed manifest lists no window"
+            exit 0
+          fi
+          checked=$((first - 1))
+          if [ -f mainnet/crosschecked ]; then
+            checked=$(cat mainnet/crosschecked)
+            [[ "$checked" =~ ^[0-9]+$ ]]
+          fi
+          behind=$(((covered - checked) / WINDOW_LEDGERS))
+          echo "$behind committed windows are not cross-checked yet"
+          if [ "$behind" -gt "$MAX_UNCHECKED" ]; then
+            echo "run this workflow by hand until the cross-check has caught up" >&2
+            exit 1
+          fi
+      - name: Fetch what is published
+        run: |
+          "$RUNNER_TEMP/archive" fetch --url "https://private.cyphras.com/$NETWORK/xlm/archive" \
+            --out "$NETWORK/xlm" --deployment "contracts/deployments/$NETWORK.json" \
+            --rpc "$RPC_URL_1" --rpc "$RPC_URL_2"
+      - name: Verify it against two independent RPCs
+        run: |
+          "$RUNNER_TEMP/archive" verify --dir "$NETWORK/xlm" --deployment "contracts/deployments/$NETWORK.json" \
+            --rpc "$RPC_URL_1" --rpc "$RPC_URL_2"
+      # The branch is fetched again right before the push and the commit goes on top of it, so
+      # what an earlier job or a maintainer pushed meanwhile does not make the push fail.
+      - name: Commit what changed and push it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          git add -A -- "$NETWORK/xlm/manifest.json"
+          if [ -d "$NETWORK/xlm/windows" ]; then
+            git add -A -- "$NETWORK/xlm/windows"
+          fi
+          if git diff --cached --quiet; then
+            echo "nothing new for $NETWORK"
+            exit 0
+          fi
+          covered=$(jq -r .coveredTo "$NETWORK/xlm/manifest.json")
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "mirror $NETWORK/xlm to ledger $covered"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic $auth"
+          git fetch -q origin "$BRANCH"
+          git rebase -q "origin/$BRANCH"
+          git push -q origin "HEAD:refs/heads/$BRANCH"
+
+  crosscheck:
+    # Mainnet only: no public ledger metadata archive exists for testnet. It runs after the mirror
+    # job when both run, so the two never push at once.
+    needs: mirror
+    if: ${{ !cancelled() && (github.event.schedule == '43 4 * * 1' || github.event_name == 'workflow_dispatch') && vars.MAINNET_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    permissions:
+      contents: write
+    steps:
+      - name: Check the pins
+        run: |
+          [[ "$ARCHIVE_IMAGE" =~ ^ghcr\.io/cyphras/cyphras-contracts/archive@sha256:[0-9a-f]{64}$ ]]
+          [[ "$CONTRACTS_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^services-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Find the default branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ steps.branch.outputs.name }}
+          persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: cyphras/cyphras-contracts
+          ref: ${{ env.CONTRACTS_COMMIT }}
+          path: contracts
+          sparse-checkout: deployments
+          persist-credentials: false
+      - name: Get the archive tool from the pinned release image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "oci://$ARCHIVE_IMAGE" --repo cyphras/cyphras-contracts \
+            --signer-workflow cyphras/cyphras-contracts/.github/workflows/services-release.yml \
+            --source-ref "refs/tags/$RELEASE_TAG" --source-digest "$CONTRACTS_COMMIT" \
+            --deny-self-hosted-runners > /dev/null
+          container=$(docker create "$ARCHIVE_IMAGE")
+          docker cp "$container:/service" "$RUNNER_TEMP/archive"
+          docker rm "$container" > /dev/null
+      # The copy starts as the published directory, so a rebuilt window that differs from its
+      # published one is refused by the tool, and the windows are compared again afterwards. The
+      # run covers the windows after the last one checked, and not only the newest ones, so a
+      # skipped week or a mirror that caught up by many windows leaves none unchecked.
+      - name: Rebuild the windows not checked yet from the ledger metadata archive
+        run: |
+          published=mainnet/xlm/manifest.json
+          if [ ! -f "$published" ]; then
+            echo "nothing is committed yet"
+            exit 0
+          fi
+          covered=$(jq -r .coveredTo "$published")
+          first=$(jq -r '.windows[0].start // empty' "$published")
+          if [ -z "$first" ]; then
+            echo "the committed manifest lists no window"
+            exit 0
+          fi
+          checked=$((first - 1))
+          if [ -f mainnet/crosschecked ]; then
+            checked=$(cat mainnet/crosschecked)
+            [[ "$checked" =~ ^[0-9]+$ ]]
+          fi
+          from=$((checked + 1))
+          if [ "$from" -gt "$covered" ]; then
+            echo "every published window has been checked"
+            exit 0
+          fi
+          to=$((from + CROSSCHECK_BATCH * WINDOW_LEDGERS - 1))
+          if [ "$to" -gt "$covered" ]; then
+            to=$covered
+          fi
+          cp -R mainnet/xlm "$RUNNER_TEMP/rebuilt"
+          "$RUNNER_TEMP/archive" rebuild --ledger-meta "$LEDGER_META" \
+            --deployment contracts/deployments/mainnet.json --out "$RUNNER_TEMP/rebuilt" \
+            --from "$from" --to "$to" --workers 32
+          cmp <(jq -S .windows "$published") <(jq -S .windows "$RUNNER_TEMP/rebuilt/manifest.json")
+          echo "CHECKED_TO=$to" >> "$GITHUB_ENV"
+      - name: Record how far the windows have been checked and push it
+        if: env.CHECKED_TO != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          printf '%s\n' "$CHECKED_TO" > mainnet/crosschecked
+          git add -- mainnet/crosschecked
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "cross-checked mainnet/xlm to ledger $CHECKED_TO"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic $auth"
+          git fetch -q origin "$BRANCH"
+          git rebase -q "origin/$BRANCH"
+          git push -q origin "HEAD:refs/heads/$BRANCH"
