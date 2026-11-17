@@ -5,7 +5,7 @@
   "vault": "CDV4V6W4MGMEVYYXENX2QXZCID7NT2UGAH2EWEBO3JUHO47Q27J7NTLL",
   "deployLedger": 5012547,
   "windowLedgers": 17280,
-  "coveredTo": 5754239,
+  "coveredTo": 5771519,
   "windows": [
     {
       "start": 5011200,
@@ -490,6 +490,17 @@
       "nullifiers": 14,
       "bytes": 21904,
       "sha256": "0b0f8df8dccd7669d8d228ea6267f07cfa322921c100a16e101fd4bce5efc69a"
+    },
+    {
+      "start": 5754240,
+      "end": 5771519,
+      "events": 0,
+      "leaves": [
+        336,
+        336
+      ],
+      "nullifiers": 0,
+      "bytes": 0
     }
   ],
   "producer": "cyphras-archive/services-v1.1.0"
