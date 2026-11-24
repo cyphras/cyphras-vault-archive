@@ -5,7 +5,7 @@
   "vault": "CDE6MIQAS4P3YXAH6SFFYUP5XPPVPXXAVCTO5ATEUUTJW376KUTKQK7Z",
   "deployLedger": 64939550,
   "windowLedgers": 17280,
-  "coveredTo": 65612159,
+  "coveredTo": 65629439,
   "windows": [
     {
       "start": 64938240,
@@ -432,6 +432,17 @@
     {
       "start": 65594880,
       "end": 65612159,
+      "events": 0,
+      "leaves": [
+        28,
+        28
+      ],
+      "nullifiers": 0,
+      "bytes": 0
+    },
+    {
+      "start": 65612160,
+      "end": 65629439,
       "events": 0,
       "leaves": [
         28,
